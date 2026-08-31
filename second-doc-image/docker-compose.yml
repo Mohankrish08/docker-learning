@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: second-doc-image
+    ports:
+      - "5000:5000"
+    environment:
+      - DEBUG=False
+      - PORT=5000
+    volumes:
+      - ./app.py:/app/app.py  # Hot reload for development
+    restart: unless-stopped
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

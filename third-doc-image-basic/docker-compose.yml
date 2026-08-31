@@ -1,0 +1,24 @@
+
+services:
+
+  # CONTAINER 1 — the website
+  web:
+    build: .
+    image: simple-app:v1
+    command: python web.py        # <-- makes it a website
+    ports:
+      - "5000:5000"
+    volumes:
+      - shared-data:/data
+
+  # CONTAINER 2 — the writer
+  writer:
+    build: .
+    image: simple-app:v1          # <-- SAME image
+    command: python writer.py     # <-- makes it a writer
+    volumes:
+      - shared-data:/data         # same folder, so both see the same file
+
+# a folder Docker keeps, shared by both containers
+volumes:
+  shared-data:
