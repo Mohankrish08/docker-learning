@@ -1,0 +1,139 @@
+# =====================================================================
+#  FOUR services now, still ONE image of our own.
+#
+#    db     - Postgres  : the source of truth        (someone else's image)
+#    queue  - Redis     : the work announcement      (someone else's image)
+#    api    - our image : accepts requests, fast
+#    worker - our image : does the slow work
+#
+#  The lesson of this file is in three places:
+#    1. depends_on + condition: service_healthy   (start ORDER vs READINESS)
+#    2. which services have `ports:` and which do not  (publish vs expose)
+#    3. two networks, so the worker is unreachable from your laptop
+# =====================================================================
+
+services:
+
+  # -------------------------------------------------------------------
+  # POSTGRES — replaces the SQLite file from class 3.
+  # -------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: task-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskpass}
+      POSTGRES_DB: ${POSTGRES_DB:-tasks}
+    volumes:
+      # The named volume IS the database. Delete it and the business data
+      # is gone — `docker compose down` keeps it, `down -v` destroys it.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready is the only honest answer to "can you serve queries yet?"
+      # Postgres opens its port several seconds BEFORE it can accept them.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-taskuser} -d ${POSTGRES_DB:-tasks}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - backend
+    # NO `ports:` on purpose. The database is reachable from the api and
+    # worker containers and from nowhere else — not even from your laptop.
+    # To inspect it during development, do NOT publish the port; run:
+    #     docker compose exec db psql -U taskuser -d tasks
+
+  # -------------------------------------------------------------------
+  # REDIS — replaces the "poll the database every 2 seconds" loop.
+  # -------------------------------------------------------------------
+  queue:
+    image: redis:7-alpine
+    container_name: task-queue
+    # appendonly yes = write every change to disk, so a restart does not
+    # silently drop queued job ids. Even so, Postgres remains the truth.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - backend
+
+  # -------------------------------------------------------------------
+  # OUR API — the only service reachable from outside.
+  # -------------------------------------------------------------------
+  api:
+    build: .
+    image: fourth-doc-image:v1       # <-- the image is named here
+    container_name: task-api
+    environment:
+      APP_ROLE: api                  # <-- this is what makes it an API
+      PORT: 5000
+      DEBUG: "False"
+      # Note the hostnames: `db` and `queue` are the SERVICE NAMES above.
+      # Docker runs a DNS server on each network that resolves them to the
+      # right container's IP. No IP addresses anywhere, ever.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-taskuser}:${POSTGRES_PASSWORD:-taskpass}@db:5432/${POSTGRES_DB:-tasks}
+      REDIS_URL: redis://queue:6379/0
+    ports:
+      - "5000:5000"                  # published: your browser can reach this
+    depends_on:
+      # ⭐ THE HEADLINE OF THIS CLASS ⭐
+      # Plain `depends_on: [db]` only waits for the container to START.
+      # Postgres takes several more seconds to accept connections, so the
+      # api would boot, fail to connect, and crash-loop. `service_healthy`
+      # waits for the healthcheck above to pass instead.
+      db:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - frontend                     # reachable from the host
+      - backend                      # can reach db + queue
+
+  # -------------------------------------------------------------------
+  # OUR WORKER — same image, no port, no way in from outside.
+  # -------------------------------------------------------------------
+  worker:
+    build: .                         # same folder, same Dockerfile...
+    image: fourth-doc-image:v1       # ...so this resolves to the SAME image.
+                                     # Compose builds it once; this is a cache hit.
+    environment:
+      APP_ROLE: worker               # <-- this is what makes it a worker
+      DATABASE_URL: postgresql://${POSTGRES_USER:-taskuser}:${POSTGRES_PASSWORD:-taskpass}@db:5432/${POSTGRES_DB:-tasks}
+      REDIS_URL: redis://queue:6379/0
+      JOB_DURATION: ${JOB_DURATION:-3}
+    depends_on:
+      db:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - backend                      # backend ONLY — not on the frontend
+    # No container_name: that would break `--scale worker=3`, because two
+    # containers cannot share a name. Try it:
+    #     docker compose up -d --scale worker=3
+
+volumes:
+  pgdata:                            # the database files
+  redisdata:                         # the queue's append-only log
+
+networks:
+  frontend:                          # host <-> api
+    driver: bridge
+  backend:                           # api/worker <-> db/queue. No host access.
+    driver: bridge
